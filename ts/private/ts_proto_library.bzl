@@ -51,7 +51,7 @@ def _import_main_output_proto_path(path):
     return None
 
 # buildifier: disable=function-docstring-header
-def _protoc_action(ctx, proto_info, outputs):
+def _protoc_action(ctx, proto_info, import_rewrite_info, outputs):
     """Create an action like
     bazel-out/k8-opt-exec-2B5CBBC6/bin/external/com_google_protobuf/protoc $@' '' \
       '--plugin=protoc-gen-es=bazel-out/k8-opt-exec-2B5CBBC6/bin/plugin/bufbuild/protoc-gen-es.sh' \
@@ -83,6 +83,8 @@ def _protoc_action(ctx, proto_info, outputs):
     args.add_joined(["--plugin", "protoc-gen-es", _windows_path_normalize(ctx.executable.protoc_gen_es.path)], join_with = "=")
     for (key, value) in options.items():
         args.add_joined(["--es_opt", key, value], join_with = "=")
+    for rewrite in import_rewrite_info.rewrites:
+        args.add("--es_opt=rewrite_imports=" + rewrite)
     args.add_joined(["--es_out", plugin_output], join_with = "=")
 
     if ctx.attr.gen_connect_es:
@@ -154,16 +156,47 @@ def _declare_outs(ctx, info, ext):
 
 def _ts_proto_library_impl(ctx):
     info = ctx.attr.proto[ProtoInfo]
+    import_rewrite_info = ctx.attr.proto[ImportRewriteInfo]
     js_outs = _declare_outs(ctx, info, ".js")
     dts_outs = _declare_outs(ctx, info, ".d.ts")
 
-    _protoc_action(ctx, info, js_outs + dts_outs)
+    _protoc_action(ctx, info, import_rewrite_info, js_outs + dts_outs)
 
     return [
         DefaultInfo(
             files = depset(js_outs + dts_outs),
         ),
     ]
+
+ImportRewriteInfo = provider(
+    fields = {
+        'rewrites': 'Import rewrites to pass via the rewrite_imports flag to protoc-gen-es',
+    }
+)
+
+def _original_import(canonical_path):
+    return "./" + canonical_path.replace(".proto", "_pb.js")
+
+def _replacement(package, name):
+    return "./" + package + "/_virtual_imports/" + name
+
+def _import_rewrite_aspect_impl(target, ctx):
+    rewrites = []
+    for dep in ctx.rule.attr.deps:
+        proto_source_root = dep[ProtoInfo].proto_source_root
+        if proto_source_root.find("/_virtual_imports/") != -1:
+            for source in dep[ProtoInfo].direct_sources:
+                canonical_path = source.path.removeprefix(proto_source_root)[1:]
+                rewrites.append(_original_import(canonical_path) + ":" + _replacement(dep.label.package, dep.label.name))
+    return [
+        ImportRewriteInfo(rewrites = rewrites)
+    ]
+
+_import_rewrite_aspect = aspect(
+    implementation = _import_rewrite_aspect_impl,
+    attr_aspects = ['deps'],
+    required_providers = [ProtoInfo],
+)
 
 ts_proto_library = rule(
     implementation = _ts_proto_library_impl,
@@ -185,6 +218,7 @@ ts_proto_library = rule(
             doc = "proto_library to generate JS/DTS for",
             providers = [ProtoInfo],
             mandatory = True,
+	    aspects = [_import_rewrite_aspect],
         ),
         "protoc_gen_options": attr.string_dict(
             doc = "dict of protoc_gen_es options",
